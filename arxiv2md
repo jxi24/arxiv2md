@@ -1,0 +1,218 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = [
+#   "feedparser",
+#   "markdownify",
+#   "scikit-learn",
+#   "nltk",
+# ]
+# ///
+
+
+import feedparser
+import time
+from markdownify import markdownify
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
+import re
+import nltk
+from nltk.stem import WordNetLemmatizer
+from nltk.corpus import wordnet
+import textwrap
+
+
+def collect_articles(archives, updates=False):
+    """
+    Collect all articles from the list of archives for today.
+
+    Args:
+        archives: List of archives to get articles from
+        updates: Whether to include updated articles
+
+    Returns:
+        The date of the feed, and a list of all unique articles
+    """
+    articles = {}
+    if not updates:
+        print("Updated articles will be removed")
+    requests = '+'.join(archives)
+    feed = feedparser.parse(f"http://rss.arxiv.org/rss/{requests}")
+
+    for entry in feed.entries:
+        if (not updates) and "Type: replace" in entry.summary:
+            continue
+        articles[entry['id']] = entry
+    print(f"Unique entries: {len(articles)}")
+
+    return feed.feed.updated_parsed, list(articles.values())
+
+
+def get_wordnet_pos(word):
+    """
+    Map POS tag to first character lemmatize() accepts.
+
+    Args:
+        word: Word to find part of speech of
+
+    Returns:
+        Part of speech in wordnet format
+    """
+    tag = nltk.pos_tag([word])[0][1][0].upper()
+    tag_dict = {"J": wordnet.ADJ,
+                "N": wordnet.NOUN,
+                "V": wordnet.VERB,
+                "R": wordnet.ADV}
+    return tag_dict.get(tag, wordnet.NOUN)
+
+
+def preprocess_article(article):
+    """
+    Preprocess the article to remove numbers and other unnecessary information
+    to improve the ability to compare articles to the user's list of keywords.
+
+    Args:
+        article: The article to process
+
+    Returns:
+        The text of the article after processing
+    """
+    title = article.title.rstrip("*")[:article.title.rfind("(")]
+    text = title + article.summary
+    text = re.sub(r'$[a-zA-Z0-9]*$', '', text)
+    text = re.sub(r'_[a-zA-Z0-9]*', '', text)
+    text = re.sub(r'[0-9]', '', text)
+    lemmatizer = WordNetLemmatizer()
+    text = " ".join([lemmatizer.lemmatize(w, get_wordnet_pos(w))
+                     for w in nltk.word_tokenize(text)])
+    return text
+
+
+def preprocess_keywords(keywords):
+    """
+    Preprocess the keywords
+
+    Args:
+        keywords: The keywords to process
+
+    Returns:
+        The list of keywords after processing
+    """
+    lemmatizer = WordNetLemmatizer()
+    text = " ".join([lemmatizer.lemmatize(w, get_wordnet_pos(w))
+                     for w in nltk.word_tokenize(keywords)])
+    return text
+
+
+def vectorize(keywords, docs):
+    """
+    Convert the articles and keywords into a set of TF-IDF vectors
+
+    Args:
+        docs: The documents of interest
+
+    Returns:
+        The TF-IDF of the documents
+    """
+    vocabulary = keywords.splitlines()
+    ngram_range = [99, 1]
+    for words in vocabulary:
+        size = len(words.split())
+        if size > ngram_range[1]:
+            ngram_range[1] = size
+        elif size < ngram_range[0]:
+            ngram_range[0] = size
+    vectorizer = TfidfVectorizer(stop_words='english',
+                                 ngram_range=tuple(ngram_range))
+    return vectorizer.fit_transform([doc for doc in docs])
+
+
+def rank_sort_articles(keywords, articles):
+    """
+    Rank the articles relevance based on the cosine-similarity
+
+    Args:
+        keywords: The keywords of interest
+        articles: The articles to search
+
+    Returns:
+        The ranking of the articles based on the keywords
+    """
+    ranks = linear_kernel(keywords, articles).flatten()
+    return ranks.argsort()[::-1][1:]
+
+
+def create_markdown(day, articles, updates=False, link_to='pdf'):
+    """
+    Translate the articles to markdown and clean up some formatting
+
+    Args:
+        day: The date of the arxiv
+        articles: The list of articles to convert to markdown
+        updates: Include updated articles or not
+        link_to: Provide a link to the pdf or the abstract page
+
+    Returns:
+        The markdown representation of all the articles
+    """
+    if updates:
+        update_string = "with replacements"
+    else:
+        update_string = ""
+
+    # Create HTML representation of all the articles
+    out = f"<h1>{day} {update_string}</h1>\n"
+    print("Ranking articles")
+    with open('arxiv_keywords.txt', 'r') as keyword_file:
+        keywords = keyword_file.read()
+    docs = [preprocess_keywords(keywords)]
+    for article in articles:
+        docs.append(preprocess_article(article))
+    tfidf = vectorize(keywords, docs)
+    ranking = rank_sort_articles(tfidf[0:1], tfidf)
+    articles = [articles[i-1] for i in ranking]
+    print("Writing out results")
+    for article in articles:
+        if "((" in article.author:
+            article.author = article.author.split("((")[0]
+            article.author = re.sub(r' \([0-9]*\)', '', article.author)
+        if "collaboration" in article.author.lower():
+            article.author = article.author.split(">:")[0]
+        article.author = article.author.replace(", ", "\n - ")
+        link = article.link.replace('abs', link_to, 1)
+        # Replace greater than and less than symbols with html encoding
+        title = article.title.replace("<", "&#60;")
+        title = title.replace(">", "&#62;")
+        title = title.rstrip("*")
+        abstract = textwrap.fill(article.summary.split("Abstract: ")[1],
+                                 width=80)
+        out = out + rf"<h2>{title}</h2>" + "\n"
+        out = out + rf"<p><a href='{link}'>Link</a></p>" + "\n"
+        out = out + f"<p>Authors:\n - {article.author}</p>"
+        out = out + "<p>Abstract:\n" + abstract + "</p>\n"
+    return markdownify(out, heading_style="ATX", escape_misc=False)
+
+
+if __name__ == "__main__":
+    import argparse
+    description = "Obtain desired arXiv articles ranked by keywords"
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--archive", help="The arXivs to fetch", nargs="+",
+                        default=["hep-ph", "hep-th", "hep-lat", "hep-ex",
+                                 "nucl-th", "nucl-ex", "cs.LG", "stat.ML"])
+    parser.add_argument("-r", "--replacements",
+                        help="Fetch the replacements",
+                        action="store_true", default=False)
+    parser.add_argument("-a", "--link-to-abstract",
+                        help="Link to abstract or pdf (default: PDF)",
+                        action="store_true", default=False)
+    args = parser.parse_args()
+    if args.link_to_abstract:
+        link_to = "abs"
+    else:
+        link_to = "pdf"
+    day, articles = collect_articles(args.archive)
+    filename = f'news/arxiv_{time.strftime("%y%m%d", day)}.md'
+    day = time.strftime("%F", day)
+    with open(filename, 'w') as output:
+        output.write(create_markdown(day, articles,
+                                     args.replacements, link_to))
